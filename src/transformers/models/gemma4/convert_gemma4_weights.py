@@ -1111,6 +1111,7 @@ def convert_transformer_weights(
     first_kv_shared_layer_idx = config.num_hidden_layers - getattr(config, "num_kv_shared_layers", 0)
 
     # Handle new checkpoint format: transformer/layer_N/...
+    # Handle new checkpoint format: transformer/layer_N/...
     # TODO(philculliton):Direct handling for unstacked checkpoint type, needs to be merged to allow for unified tensor handling
     if path.startswith(f"{_TRANSFORMER_PARAMETER}/layer_"):
         # Extract layer number from path like "transformer/layer_0/attn/q_einsum"
@@ -1118,24 +1119,28 @@ def convert_transformer_weights(
         layer_idx = int(layer_str.replace("layer_", ""))  # 0
         is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx >= 0
         base_path = f"layers.{layer_idx}"
+        layer_cfg = (
+            config.per_layer_config[layer_idx]
+            if hasattr(config, "per_layer_config") and config.per_layer_config is not None
+            else config
+        )
+        head_dim = getattr(layer_cfg, "head_dim", getattr(config, "head_dim", 256))
+        num_attn_heads = getattr(layer_cfg, "num_attention_heads", getattr(config, "num_attention_heads", 16))
+        num_kv_heads = getattr(layer_cfg, "num_key_value_heads", getattr(config, "num_key_value_heads", 8))
 
-        # Determine head_dim from actual checkpoint weight dimensions
-        # For q_einsum/key_norm, the last dimension tells us the head_dim
-        # Otherwise fall back to config
+        # Determine head_dim from actual checkpoint weight dimensions if possible
         if path.endswith("attn/key_norm") or path.endswith("attn/query_norm"):
             head_dim = weights.shape[0]  # The norm dimension IS the head_dim
         elif path.endswith("attn/q_einsum"):
             head_dim = weights.shape[-1]  # Last dimension is head_dim
-        else:
-            # Fall back to config-based determination
-            head_dim = config.per_layer_config[layer_idx].head_dim
+
         # Note: In new format, weights are per-layer (not batched), so no enumerate loop needed
         matrix = weights
 
         if path.endswith("attn/attn_vec_einsum"):
             converted_paths.append(f"{base_path}.self_attn.o_proj.weight")
             converted_weights.append(
-                matrix.transpose(2, 0, 1).reshape(config.hidden_size, config.num_attention_heads * head_dim)
+                matrix.transpose(2, 0, 1).reshape(config.hidden_size, num_attn_heads * head_dim)
             )
         elif path.endswith("attn/kv_einsum") and not is_kv_shared_layer:
             converted_paths.extend(
@@ -1145,7 +1150,7 @@ def convert_transformer_weights(
                 ]
             )
             k_proj_weights, v_proj_weights = matrix.transpose(0, 2, 1, 3)
-            kv_proj_shape = (config.hidden_size, config.num_key_value_heads * head_dim)
+            kv_proj_shape = (config.hidden_size, num_kv_heads * head_dim)
             converted_weights.extend(
                 [
                     k_proj_weights.reshape(kv_proj_shape).transpose(),
@@ -1156,14 +1161,14 @@ def convert_transformer_weights(
             converted_paths.append(f"{base_path}.self_attn.k_proj.weight")
             converted_weights.append(
                 matrix.transpose(1, 0, 2)
-                .reshape(config.hidden_size, config.per_layer_config[layer_idx].num_key_value_heads * head_dim)
+                .reshape(config.hidden_size, num_kv_heads * head_dim)
                 .transpose()
             )
         elif path.endswith("attn/q_einsum"):
             converted_paths.append(f"{base_path}.self_attn.q_proj.weight")
             converted_weights.append(
                 matrix.transpose(1, 0, 2)
-                .reshape(config.hidden_size, config.num_attention_heads * head_dim)
+                .reshape(config.hidden_size, num_attn_heads * head_dim)
                 .transpose()
             )
         elif path.endswith("attn/query_norm"):
@@ -1173,10 +1178,36 @@ def convert_transformer_weights(
             converted_paths.append(f"{base_path}.self_attn.k_norm.weight")
             converted_weights.append(matrix.squeeze())
         elif path.endswith("mlp/gating_einsum"):
+            if getattr(config, "enable_moe_block", False):
+                num_experts, _, expert_inter, hidden_size = matrix.shape
+                gate_up_proj_weight = np.asarray(matrix).reshape(num_experts, 2 * expert_inter, hidden_size)
+                converted_paths.append(f"{base_path}.experts.gate_up_proj")
+                converted_weights.append(gate_up_proj_weight)
+            else:
+                gate_proj_weight, up_proj_weight = matrix
+                converted_paths.extend([f"{base_path}.mlp.gate_proj.weight", f"{base_path}.mlp.up_proj.weight"])
+                converted_weights.extend([gate_proj_weight, up_proj_weight])
+        elif path.endswith("mlp/linear"):
+            if getattr(config, "enable_moe_block", False):
+                converted_paths.append(f"{base_path}.experts.down_proj")
+                converted_weights.append(matrix.transpose(0, 2, 1))
+            else:
+                converted_paths.append(f"{base_path}.mlp.down_proj.weight")
+                converted_weights.append(matrix.transpose())
+        elif path.endswith("mlp/router_logits"):
+            converted_paths.append(f"{base_path}.router.proj.weight")
+            converted_weights.append(matrix.transpose())
+        elif param == "router_scale" and path.endswith("mlp"):
+            converted_paths.append(f"{base_path}.router.scale")
+            converted_weights.append(matrix)
+        elif param == "per_expert_scale" and path.endswith("mlp"):
+            converted_paths.append(f"{base_path}.router.per_expert_scale")
+            converted_weights.append(matrix)
+        elif path.endswith("mlp2/gating_einsum"):
             converted_paths.extend([f"{base_path}.mlp.gate_proj.weight", f"{base_path}.mlp.up_proj.weight"])
             gate_proj_weight, up_proj_weight = matrix
             converted_weights.extend([gate_proj_weight, up_proj_weight])
-        elif path.endswith("mlp/linear"):
+        elif path.endswith("mlp2/linear"):
             converted_paths.append(f"{base_path}.mlp.down_proj.weight")
             converted_weights.append(matrix.transpose())
         elif path.endswith("per_layer_input_gate"):
@@ -1191,6 +1222,15 @@ def convert_transformer_weights(
         elif path.endswith("post_ffw_norm"):
             converted_paths.append(f"{base_path}.post_feedforward_layernorm.weight")
             converted_weights.append(matrix)
+        elif path.endswith("post_ffw1_norm"):
+            converted_paths.append(f"{base_path}.post_feedforward_layernorm_2.weight")
+            converted_weights.append(matrix)
+        elif path.endswith("post_ffw2_norm"):
+            converted_paths.append(f"{base_path}.post_feedforward_layernorm_1.weight")
+            converted_weights.append(matrix)
+        elif path.endswith("pre_ffw2_norm"):
+            converted_paths.append(f"{base_path}.pre_feedforward_layernorm.weight")
+            converted_weights.append(matrix)
         elif path.endswith("post_per_layer_input_norm"):
             converted_paths.append(f"{base_path}.post_per_layer_input_norm.weight")
             converted_weights.append(matrix)
@@ -1198,7 +1238,10 @@ def convert_transformer_weights(
             converted_paths.append(f"{base_path}.input_layernorm.weight")
             converted_weights.append(matrix)
         elif path.endswith("pre_ffw_norm"):
-            converted_paths.append(f"{base_path}.pre_feedforward_layernorm.weight")
+            if getattr(config, "enable_moe_block", False):
+                converted_paths.append(f"{base_path}.pre_feedforward_layernorm_2.weight")
+            else:
+                converted_paths.append(f"{base_path}.pre_feedforward_layernorm.weight")
             converted_weights.append(matrix)
         elif path.endswith(layer_str) and param == "skip_scale":
             converted_paths.append(f"{base_path}.layer_scalar")
@@ -1217,14 +1260,21 @@ def convert_transformer_weights(
             layer_idx = _SLIDING_WINDOW_PATTERN * i + attention_type_index
             is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx >= 0
             base_path = f"layers.{layer_idx}"
-            head_dim = config.per_layer_config[layer_idx].head_dim
+            layer_cfg = (
+                config.per_layer_config[layer_idx]
+                if hasattr(config, "per_layer_config") and config.per_layer_config is not None
+                else config
+            )
+            head_dim = getattr(layer_cfg, "head_dim", getattr(config, "head_dim", 256))
+            num_attn_heads = getattr(layer_cfg, "num_attention_heads", getattr(config, "num_attention_heads", 16))
+            num_kv_heads = getattr(layer_cfg, "num_key_value_heads", getattr(config, "num_key_value_heads", 8))
             if param == "skip_scale":
                 converted_paths.append(f"{base_path}.layer_scalar")
                 converted_weights.append(matrix)
             elif path.endswith("attn/attn_vec_einsum"):
                 converted_paths.append(f"{base_path}.self_attn.o_proj.weight")
                 converted_weights.append(
-                    matrix.transpose(2, 0, 1).reshape(config.hidden_size, config.num_attention_heads * head_dim)
+                    matrix.transpose(2, 0, 1).reshape(config.hidden_size, num_attn_heads * head_dim)
                 )
             elif path.endswith("attn/kv_einsum") and not is_kv_shared_layer:
                 converted_paths.extend(
@@ -1234,7 +1284,7 @@ def convert_transformer_weights(
                     ]
                 )
                 k_proj_weights, v_proj_weights = matrix.transpose(0, 2, 1, 3)
-                kv_proj_shape = (config.hidden_size, config.num_key_value_heads * head_dim)
+                kv_proj_shape = (config.hidden_size, num_kv_heads * head_dim)
                 converted_weights.extend(
                     [
                         k_proj_weights.reshape(kv_proj_shape).transpose(),
@@ -1245,14 +1295,14 @@ def convert_transformer_weights(
                 converted_paths.append(f"{base_path}.self_attn.k_proj.weight")
                 converted_weights.append(
                     matrix.transpose(1, 0, 2)
-                    .reshape(config.hidden_size, config.per_layer_config[layer_idx].num_key_value_heads * head_dim)
+                    .reshape(config.hidden_size, num_kv_heads * head_dim)
                     .transpose()
                 )
             elif path.endswith("attn/q_einsum"):
                 converted_paths.append(f"{base_path}.self_attn.q_proj.weight")
                 converted_weights.append(
                     matrix.transpose(1, 0, 2)
-                    .reshape(config.hidden_size, config.num_attention_heads * head_dim)
+                    .reshape(config.hidden_size, num_attn_heads * head_dim)
                     .transpose()
                 )
             elif path.endswith("attn/query_norm"):
@@ -2399,6 +2449,10 @@ def main(*args):
 
     config = _VARIANTS[variant]
     is_drafter = variant in _ASSISTANT_VARIANTS
+
+    config.allow_global_per_layer_attribute_access = True
+    if hasattr(config, "text_config") and config.text_config is not None:
+        config.text_config.allow_global_per_layer_attribute_access = True
 
     logging.info("Converting Gemma 4 variant: %s", variant)
 
